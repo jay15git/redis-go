@@ -7,6 +7,12 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+)
+
+var (
+	storage = make(map[string]string)
+	mutex   = sync.RWMutex{}
 )
 
 func main() {
@@ -105,8 +111,38 @@ func handleConnection(conn net.Conn) {
 					response := fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
 					conn.Write([]byte(response))
 				}
+			case "SET":
+				if len(command) >= 3 {
+					key := command[1]
+					value := command[2]
+
+					mutex.Lock()
+					storage[key] = value
+					mutex.Unlock()
+
+					conn.Write([]byte("+OK\r\n"))
+				} else {
+					conn.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
+				}
+
+			case "GET":
+				if len(command) >= 2 {
+					key := command[1]
+
+					mutex.RLock()
+					value, exists := storage[key]
+					mutex.RUnlock()
+
+					if exists {
+						response := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
+						conn.Write([]byte(response))
+					} else {
+						conn.Write([]byte("$-1\r\n"))
+					}
+				} else {
+					conn.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
+				}
 			default:
-				// Optional: handle unknown commands
 				conn.Write([]byte("-ERR unknown command\r\n"))
 			}
 		}
