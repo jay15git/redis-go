@@ -8,10 +8,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
+// storageEntry holds the value and an optional expiry time.
+// A zero value for expiresAt means the key never expires.
+type storageEntry struct {
+	value     string
+	expiresAt time.Time
+}
+
 var (
-	storage = make(map[string]string)
+	// The storage map now holds storageEntry structs instead of just strings.
+	storage = make(map[string]storageEntry)
 	mutex   = sync.RWMutex{}
 )
 
@@ -31,19 +40,17 @@ func main() {
 			fmt.Println("Error accepting connection: ", err.Error())
 			continue
 		}
-		// Launch a goroutine for each client
 		go handleConnection(conn)
 	}
 }
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-
-	// Use a bufio.Reader for more controlled reading
 	reader := bufio.NewReader(conn)
 
 	for {
-		// 1. Read the line that specifies the array length (e.g., "*2\r\n")
+		// This block contains the simplified RESP parser from your original code.
+		// It reads the array and bulk string prefixes to build a command slice.
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
@@ -51,54 +58,42 @@ func handleConnection(conn net.Conn) {
 			}
 			return
 		}
-
-		// Clean up the line and check the prefix
 		trimmedLine := strings.TrimSuffix(line, "\r\n")
-		if trimmedLine[0] != '*' {
-			fmt.Println("Expected an array prefix '*'")
-			return
+		if len(trimmedLine) == 0 || trimmedLine[0] != '*' {
+			// Malformed command, wait for next one
+			continue
 		}
-
-		// 2. Parse the number of elements
 		numElements, err := strconv.Atoi(trimmedLine[1:])
 		if err != nil {
-			fmt.Println("Error parsing array length:", err.Error())
-			return
+			// Malformed command, wait for next one
+			continue
 		}
-
-		// 3. Loop to read each command element
 		command := make([]string, 0, numElements)
 		for i := 0; i < numElements; i++ {
-			// Read the bulk string length line (e.g., "$4\r\n")
 			bulkLenLine, err := reader.ReadString('\n')
 			if err != nil {
 				fmt.Println("Error reading bulk string length:", err.Error())
 				return
 			}
 			trimmedBulkLenLine := strings.TrimSuffix(bulkLenLine, "\r\n")
-			if trimmedBulkLenLine[0] != '$' {
-				fmt.Println("Expected a bulk string prefix '$'")
-				return
+			if len(trimmedBulkLenLine) == 0 || trimmedBulkLenLine[0] != '$' {
+				// Malformed command, wait for next one
+				break
 			}
 			bulkLen, err := strconv.Atoi(trimmedBulkLenLine[1:])
 			if err != nil {
-				fmt.Println("Error parsing bulk string length:", err.Error())
-				return
+				// Malformed command, wait for next one
+				break
 			}
-
-			// Read the actual data (e.g., "ECHO") plus the trailing "\r\n"
-			data := make([]byte, bulkLen+2) // +2 for \r\n
+			data := make([]byte, bulkLen+2)
 			_, err = io.ReadFull(reader, data)
 			if err != nil {
 				fmt.Println("Error reading bulk string data:", err.Error())
 				return
 			}
-
-			// Append the cleaned data to our command slice
 			command = append(command, string(data[:bulkLen]))
 		}
 
-		// 4. Handle the parsed command
 		if len(command) > 0 {
 			cmd := strings.ToUpper(command[0])
 			switch cmd {
@@ -107,7 +102,6 @@ func handleConnection(conn net.Conn) {
 			case "ECHO":
 				if len(command) > 1 {
 					arg := command[1]
-					// Construct the RESP Bulk String response
 					response := fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
 					conn.Write([]byte(response))
 				}
@@ -115,9 +109,24 @@ func handleConnection(conn net.Conn) {
 				if len(command) >= 3 {
 					key := command[1]
 					value := command[2]
+					var expiryTime time.Time // Zero value means no expiry
+
+					// Check for the optional 'PX' argument
+					if len(command) == 5 && strings.ToUpper(command[3]) == "PX" {
+						// Parse the millisecond value
+						ms, err := strconv.ParseInt(command[4], 10, 64)
+						if err == nil {
+							// Calculate the absolute expiry time from now
+							expiryDuration := time.Duration(ms) * time.Millisecond
+							expiryTime = time.Now().Add(expiryDuration)
+						}
+					}
 
 					mutex.Lock()
-					storage[key] = value
+					storage[key] = storageEntry{
+						value:     value,
+						expiresAt: expiryTime,
+					}
 					mutex.Unlock()
 
 					conn.Write([]byte("+OK\r\n"))
@@ -130,15 +139,28 @@ func handleConnection(conn net.Conn) {
 					key := command[1]
 
 					mutex.RLock()
-					value, exists := storage[key]
+					entry, exists := storage[key]
 					mutex.RUnlock()
 
-					if exists {
-						response := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
-						conn.Write([]byte(response))
-					} else {
-						conn.Write([]byte("$-1\r\n"))
+					if !exists {
+						conn.Write([]byte("$-1\r\n")) // Null bulk string for non-existent key
+						continue
 					}
+
+					// **CORRECTED LOGIC STARTS HERE**
+					// Check if an expiry is set and if it has passed
+					if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+						// Key has expired. Passively delete it and return null.
+						mutex.Lock()
+						delete(storage, key)
+						mutex.Unlock()
+						conn.Write([]byte("$-1\r\n")) // Null bulk string for expired key
+						continue
+					}
+
+					// Key exists and is not expired, return the value from the struct
+					response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value), entry.value)
+					conn.Write([]byte(response))
 				} else {
 					conn.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
 				}
