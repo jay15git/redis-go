@@ -11,16 +11,31 @@ import (
 	"time"
 )
 
-// storageEntry holds the value and an optional expiry time.
-// A zero value for expiresAt means the key never expires.
+// DataType is an enum to represent our different value types.
+type DataType int
+
+const (
+	String DataType = iota // Value will be 0
+	List                   // Value will be 1
+)
+
+// storageEntry holds the data for a String type, including its expiry.
 type storageEntry struct {
 	value     string
 	expiresAt time.Time
 }
 
+// Value is the unified struct that can hold any of our Redis data types.
+// This is stored in our main map.
+type Value struct {
+	dataType DataType
+	strData  *storageEntry // Pointer to a string entry
+	listData []string      // Slice for a list
+}
+
 var (
-	// The storage map now holds storageEntry structs instead of just strings.
-	storage = make(map[string]storageEntry)
+	// CORRECTED: The storage is now a map from a key to our unified Value struct.
+	storage = make(map[string]Value)
 	mutex   = sync.RWMutex{}
 )
 
@@ -50,7 +65,6 @@ func handleConnection(conn net.Conn) {
 
 	for {
 		// This block contains the simplified RESP parser from your original code.
-		// It reads the array and bulk string prefixes to build a command slice.
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
@@ -60,12 +74,10 @@ func handleConnection(conn net.Conn) {
 		}
 		trimmedLine := strings.TrimSuffix(line, "\r\n")
 		if len(trimmedLine) == 0 || trimmedLine[0] != '*' {
-			// Malformed command, wait for next one
 			continue
 		}
 		numElements, err := strconv.Atoi(trimmedLine[1:])
 		if err != nil {
-			// Malformed command, wait for next one
 			continue
 		}
 		command := make([]string, 0, numElements)
@@ -77,12 +89,10 @@ func handleConnection(conn net.Conn) {
 			}
 			trimmedBulkLenLine := strings.TrimSuffix(bulkLenLine, "\r\n")
 			if len(trimmedBulkLenLine) == 0 || trimmedBulkLenLine[0] != '$' {
-				// Malformed command, wait for next one
 				break
 			}
 			bulkLen, err := strconv.Atoi(trimmedBulkLenLine[1:])
 			if err != nil {
-				// Malformed command, wait for next one
 				break
 			}
 			data := make([]byte, bulkLen+2)
@@ -109,23 +119,24 @@ func handleConnection(conn net.Conn) {
 				if len(command) >= 3 {
 					key := command[1]
 					value := command[2]
-					var expiryTime time.Time // Zero value means no expiry
+					var expiryTime time.Time
 
-					// Check for the optional 'PX' argument
 					if len(command) == 5 && strings.ToUpper(command[3]) == "PX" {
-						// Parse the millisecond value
 						ms, err := strconv.ParseInt(command[4], 10, 64)
 						if err == nil {
-							// Calculate the absolute expiry time from now
 							expiryDuration := time.Duration(ms) * time.Millisecond
 							expiryTime = time.Now().Add(expiryDuration)
 						}
 					}
 
 					mutex.Lock()
-					storage[key] = storageEntry{
-						value:     value,
-						expiresAt: expiryTime,
+					// CORRECTED: Create the string entry, then wrap it in our main Value struct.
+					storage[key] = Value{
+						dataType: String,
+						strData: &storageEntry{
+							value:     value,
+							expiresAt: expiryTime,
+						},
 					}
 					mutex.Unlock()
 
@@ -143,26 +154,49 @@ func handleConnection(conn net.Conn) {
 					mutex.RUnlock()
 
 					if !exists {
-						conn.Write([]byte("$-1\r\n")) // Null bulk string for non-existent key
+						conn.Write([]byte("$-1\r\n"))
 						continue
 					}
 
-					// **CORRECTED LOGIC STARTS HERE**
-					// Check if an expiry is set and if it has passed
-					if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-						// Key has expired. Passively delete it and return null.
-						mutex.Lock()
-						delete(storage, key)
-						mutex.Unlock()
-						conn.Write([]byte("$-1\r\n")) // Null bulk string for expired key
-						continue
+					// CORRECTED: Use a switch on the data type for type-safe access.
+					switch entry.dataType {
+					case String:
+						// Check for expiry on the string data.
+						if !entry.strData.expiresAt.IsZero() && time.Now().After(entry.strData.expiresAt) {
+							mutex.Lock()
+							delete(storage, key)
+							mutex.Unlock()
+							conn.Write([]byte("$-1\r\n"))
+						} else {
+							// Return the string value.
+							response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.strData.value), entry.strData.value)
+							conn.Write([]byte(response))
+						}
+					default:
+						// Key exists but holds the wrong type (e.g., a list).
+						conn.Write([]byte("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"))
 					}
-
-					// Key exists and is not expired, return the value from the struct
-					response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value), entry.value)
-					conn.Write([]byte(response))
 				} else {
 					conn.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
+				}
+			case "RPUSH":
+				if len(command) >= 3 {
+					key := command[1]
+					element := command[2]
+
+					mutex.Lock()
+
+					newList := []string{element}
+					storage[key] = Value{
+						dataType: List,
+						listData: newList,
+					}
+					mutex.Unlock()
+
+					response := fmt.Sprintf(":%d\r\n", len(newList))
+					conn.Write([]byte(response))
+				} else {
+					conn.Write([]byte("-ERR wrong number of arguments for 'rpush' command\r\n"))
 				}
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
